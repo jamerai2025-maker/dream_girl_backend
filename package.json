@@ -1,0 +1,48 @@
+{
+  "name": "Nova AI",
+  "version": "1.0.0",
+  "description": "Nova Backend",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon --watch src src/index.js",
+    "build": "echo 'Build step - add TypeScript compilation if needed'",
+    "test": "jest",
+    "lint": "eslint src/",
+    "docker:dev": "docker-compose up -d",
+    "docker:dev:build": "docker-compose up -d --build",
+    "docker:dev:down": "docker-compose down",
+    "docker:dev:logs": "docker-compose logs -f app",
+    "docker:prod": "docker-compose -f docker-compose.prod.yml up -d",
+    "docker:prod:down": "docker-compose -f docker-compose.prod.yml down",
+    "db:seed": "node src/scripts/seed.js",
+    "db:migrate": "node src/scripts/migrate.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^7.0.1",
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.0.3",
+    "morgan": "^1.10.0",
+    "redis": "^4.6.12",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.56.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.2",
+    "prisma": "^7.0.1",
+    "supertest": "^6.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
