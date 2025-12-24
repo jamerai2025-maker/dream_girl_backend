@@ -6,37 +6,43 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
-const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
 
 const connectDB = require('./config/database');
 const connectRedis = require('./config/redis');
 const logger = require('./utils/logger');
-const errorHandler = require('./middleware/errorHandler');
+const { errorHandler, notFound } = require('./middleware/errorHandler.middleware');
 
 // Import Routes
 const authRoutes = require('./routes/auth.routes');
-const userRoutes = require('./routes/user.routes');
+const characterRoutes = require('./routes/character.routes');
+const characterMediaRoutes = require('./routes/characterMedia.routes');
+const attributesRoutes = require('./routes/attributes.routes');
 const healthRoutes = require('./routes/health.routes');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8088;
 
 // ==================== MIDDLEWARE ====================
 
 // Security
 app.use(helmet());
+app.use('/assets', (req, res, next) => {
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+})
 app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
   credentials: true
 }));
 
-// Rate Limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: { error: 'Too many requests, please try again later.' }
-});
-app.use('/api/', limiter);
+// Cookie Parser (for refresh token)
+app.use(cookieParser());
+
+const { apiLimiter, authLimiter } = require('./middleware/rateLimiter.middleware');
+
+// Rate Limiting (Redis-based for distributed systems)
+app.use('/api/', apiLimiter); // 100 requests per 15 minutes per IP
 
 // Body Parsing
 app.use(express.json({ limit: '10mb' }));
@@ -48,30 +54,47 @@ app.use(compression());
 // Logging
 app.use(morgan('combined', { stream: logger.stream }));
 
+// ==================== STATIC FILES ====================
+
+// Serve static files from public directory
+const path = require('path');
+app.use('/assets', express.static(path.join(__dirname, '../public/assets')));
+
 // ==================== ROUTES ====================
 
+// Health check (no /api prefix)
 app.use('/health', healthRoutes);
-app.use('/api/auth', authRoutes);
-app.use('/api/users', userRoutes);
+
+// Queue Monitoring UI (Admin only)
+const { serverAdapter } = require('./queues/queueMonitor');
+app.use('/admin/queues', serverAdapter.getRouter());
+
+// API Routes
+app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/characters', characterRoutes);
+app.use('/api/v1/characters', characterMediaRoutes);
+app.use('/api/v1/attributes', attributesRoutes);
+// app.use('/api/v1/users', userRoutes);
 
 // Root route
 app.get('/', (req, res) => {
   res.json({
-    message: 'Welcome to Node.js MongoDB API',
+    success: true,
+    message: 'Welcome to Nova AI API',
     version: '1.0.0',
-    docs: '/api/docs'
+    docs: '/api/v1/docs'
   });
 });
 
-// 404 Handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found' });
-});
+// 404 Handler (after all routes)
+app.use(notFound);
 
-// Error Handler
+// Global Error Handler (must be last)
 app.use(errorHandler);
 
 // ==================== SERVER START ====================
+
+let isShuttingDown = false;
 
 const startServer = async () => {
   try {
@@ -83,30 +106,63 @@ const startServer = async () => {
     await connectRedis.connect();
     logger.info('Redis connected successfully');
 
+    // Initialize background workers
+    require('./workers/characterCreation.worker');
+    require('./workers/imageGeneration.worker');
+    require('./workers/videoGeneration.worker');
+    logger.info('Background workers initialized');
+
     // Start Express server
-    app.listen(PORT, '0.0.0.0', () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       logger.info(`Server running on port ${PORT}`);
       logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
     });
+
+    // Graceful shutdown handler
+    const gracefulShutdown = async (signal) => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
+
+      logger.info(`${signal} received. Shutting down gracefully...`);
+
+      // Close server first (stop accepting new connections)
+      server.close(async () => {
+        logger.info('HTTP server closed');
+
+        try {
+          // Close Redis connection
+          if (connectRedis.isOpen) {
+            await connectRedis.quit();
+            logger.info('Redis connection closed');
+          }
+
+          // Close MongoDB connection
+          const mongoose = require('mongoose');
+          await mongoose.connection.close();
+          logger.info('MongoDB connection closed');
+
+          process.exit(0);
+        } catch (error) {
+          logger.error('Error during shutdown:', error);
+          process.exit(1);
+        }
+      });
+
+      // Force shutdown after 10 seconds
+      setTimeout(() => {
+        logger.error('Forced shutdown after timeout');
+        process.exit(1);
+      }, 10000);
+    };
+
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
   } catch (error) {
     logger.error('Failed to start server:', error);
     process.exit(1);
   }
 };
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received. Shutting down gracefully...');
-  await connectRedis.quit();
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received. Shutting down gracefully...');
-  await connectRedis.quit();
-  process.exit(0);
-});
 
 startServer();
 

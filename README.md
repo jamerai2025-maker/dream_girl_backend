@@ -55,12 +55,22 @@ nodejs-mongodb-docker/
 │   └── init.js              # DB initialization
 ├── nginx/
 │   └── nginx.conf           # Load balancer config
+├── docs/
+│   ├── CLOUDINARY_SETUP.md  # Cloudinary integration guide
+│   └── FRONTEND_INTEGRATION.md # Frontend API guide
 ├── docker-compose.yml       # Development
 ├── docker-compose.prod.yml  # Production
 ├── Dockerfile.dev           # Dev container
 ├── Dockerfile               # Prod container
 └── package.json
 ```
+
+## 📸 Image Storage
+
+Character images are stored using **Cloudinary** (cloud storage) with automatic fallback to local storage.
+
+**Setup Guide**: See [`docs/CLOUDINARY_SETUP.md`](docs/CLOUDINARY_SETUP.md)
+
 
 ## 🛠️ Quick Start (Development)
 
@@ -254,6 +264,7 @@ docker-compose -f docker-compose.prod.yml up -d --scale app=5
 
 ```bash
 # View all logs
+docker-compose logs -f app
 docker-compose logs -f
 
 # Access MongoDB shell
@@ -276,17 +287,14 @@ docker stats
 ```bash
 # Check if MongoDB is running
 docker ps | grep mongodb
-
 # View MongoDB logs
 docker logs mongodb
 ```
-
 ### Redis Connection Issues
 ```bash
 # Test Redis connection
 docker exec redis redis-cli ping
 ```
-
 ### App Not Starting
 ```bash
 # Check app logs
@@ -299,3 +307,7 @@ docker-compose up -d --build
 ## 📄 License
 
 MIT
+Admin Login
+{"email":"admin@nova.com","password":"password123"}
+
+chatmodel :- deepseekv3_0324
