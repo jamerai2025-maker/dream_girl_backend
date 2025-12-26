@@ -135,9 +135,12 @@ const createCharacter = async (req, res) => {
                     populatedCharacter.personalityId.occupationId || null  // Pass occupation
                 );
 
-                if (result && result.imagePath) {
+                if (result && (result.imagePath || result.cloudinaryUrl)) {
+                    // Use cloudinaryUrl if available, otherwise fall back to imagePath
+                    const imageUrl = result.cloudinaryUrl || result.imagePath;
+                    
                     // Update character with generated image
-                    character.displayImageUrls = [result.imagePath, ...(character.displayImageUrls || [])];
+                    character.displayImageUrls = [imageUrl, ...(character.displayImageUrls || [])];
                     await character.save();
 
                     // Save to CharacterMedia collection with prompt
@@ -146,12 +149,18 @@ const createCharacter = async (req, res) => {
                         characterId: character._id,
                         userId: req.user._id,
                         mediaType: 'image',
-                        mediaUrl: result.imagePath,
+                        mediaUrl: imageUrl,
                         visibility: 'personal',
                         prompt: result.promptUsed,  // Save the AI-generated prompt
                         generationParams: {
                             pose: result.pose,
                             poseCategory: result.poseCategory,
+                            cloudinaryPublicId: result.cloudinaryPublicId,
+                            cloudinaryUrl: result.cloudinaryUrl,
+                            uploadPath: result.uploadPath,
+                            fileSizeKb: result.fileSizeKb,
+                            format: result.format,
+                            quality: result.quality,
                             quality: process.env.AI_GENERATION_QUALITY || 'hq',
                             generationTime: result.generationTime
                         }
@@ -161,7 +170,8 @@ const createCharacter = async (req, res) => {
                     populatedCharacter.displayImageUrls = character.displayImageUrls;
 
                     logger.info(`✅ AI image added to character: ${character._id}`);
-                    logger.info(`   Image: ${result.imagePath}, Time: ${result.generationTime}`);
+                    logger.info(`   Image: ${imageUrl}, Time: ${result.generationTime}`);
+                    logger.info(`   Cloudinary URL: ${result.cloudinaryUrl || 'N/A'}`);
                     logger.info(`   Prompt saved to CharacterMedia`);
                 }
             } catch (err) {
@@ -332,7 +342,7 @@ const getCharacterById = async (req, res) => {
         // Check visibility permissions
         const visibility = character.categorizationId?.visibility;
         if (visibility === 'Private') {
-            if (!req.user || character.createdByUserId.toString() !== req.user._id.toString()) {
+            if (!req.user || !character.createdByUserId || character.createdByUserId.toString() !== req.user._id.toString()) {
                 return res.status(403).json({
                     success: false,
                     statusCode: 403,
@@ -350,8 +360,10 @@ const getCharacterById = async (req, res) => {
         }
 
         // Add isOwner flag
-        if (req.user) {
+        if (req.user && character.createdByUserId) {
             character.isOwner = character.createdByUserId.toString() === req.user._id.toString();
+        } else {
+            character.isOwner = false;
         }
 
         res.status(200).json({
@@ -391,7 +403,7 @@ const updateCharacter = async (req, res) => {
         }
 
         // Check ownership
-        const isOwner = character.createdByUserId.toString() === req.user._id.toString();
+        const isOwner = character.createdByUserId && character.createdByUserId.toString() === req.user._id.toString();
         const isAdmin = req.user.role === 'admin';
 
         if (!isOwner && !isAdmin) {
@@ -445,7 +457,7 @@ const deleteCharacter = async (req, res) => {
         }
 
         // Check ownership
-        const isOwner = character.createdByUserId.toString() === req.user._id.toString();
+        const isOwner = character.createdByUserId && character.createdByUserId.toString() === req.user._id.toString();
         const isAdmin = req.user.role === 'admin';
 
         if (!isOwner && !isAdmin) {
@@ -721,7 +733,7 @@ const generateImageForCharacter = async (req, res) => {
         }
 
         // Check ownership
-        const isOwner = character.createdByUserId.toString() === req.user._id.toString();
+        const isOwner = character.createdByUserId && character.createdByUserId.toString() === req.user._id.toString();
         const isAdmin = req.user.role === 'admin';
 
         if (!isOwner && !isAdmin) {
@@ -782,6 +794,16 @@ const generateImageForCharacter = async (req, res) => {
         logger.info(`🎨 Starting AI image generation for character: ${character.name} (${character._id})`);
         logger.info(`   Pose: ${poseToUse.name || 'Custom'}, Custom Prompt: ${customPrompt ? 'Yes' : 'No'}`);
 
+        // Get populated character to access occupation
+        const populatedChar = await populateCharacter(character);
+        const occupation = populatedChar?.personalityId?.occupationId || null;
+        
+        if (occupation) {
+            logger.info(`✅ Occupation found: ${occupation.name || 'Unknown'}`);
+        } else {
+            logger.warn(`⚠️ No occupation found for character: ${character.name}`);
+        }
+
         // Generate image
         const result = await generateCharacterImage(
             {
@@ -792,17 +814,17 @@ const generateImageForCharacter = async (req, res) => {
                 gender: character.gender,
                 description: character.description,
                 // Physical attributes
-                bodyType: character.physicalAttributesId?.bodyType,
-                hairColor: character.physicalAttributesId?.hairColor,
-                hairStyle: character.physicalAttributesId?.hairStyle,
-                eyeColor: character.physicalAttributesId?.eyeColor,
-                skinColor: character.physicalAttributesId?.skinColor,
-                ethnicity: character.physicalAttributesId?.ethnicity,
-                breastSize: character.physicalAttributesId?.breastSize,
-                buttSize: character.physicalAttributesId?.buttSize
+                bodyType: populatedChar?.physicalAttributesId?.bodyType,
+                hairColor: populatedChar?.physicalAttributesId?.hairColor,
+                hairStyle: populatedChar?.physicalAttributesId?.hairStyle,
+                eyeColor: populatedChar?.physicalAttributesId?.eyeColor,
+                skinColor: populatedChar?.physicalAttributesId?.skinColor,
+                ethnicity: populatedChar?.physicalAttributesId?.ethnicity,
+                breastSize: populatedChar?.physicalAttributesId?.breastSize,
+                buttSize: populatedChar?.physicalAttributesId?.buttSize
             },
             poseToUse,
-            character.personalityId?.occupationId || null  // Pass occupation
+            occupation  // Pass occupation object (with name property) or null
         );
 
         if (!result || !result.imagePath) {
@@ -814,7 +836,18 @@ const generateImageForCharacter = async (req, res) => {
         }
 
         // Update character with generated image
-        character.displayImageUrls = [result.imagePath, ...(character.displayImageUrls || [])];
+        // Use cloudinaryUrl if available, otherwise fall back to imagePath
+        const imageUrl = result.cloudinaryUrl || result.imagePath;
+        
+        if (!imageUrl) {
+            return res.status(500).json({
+                success: false,
+                statusCode: 500,
+                message: 'Image generation failed - no image URL returned'
+            });
+        }
+        
+        character.displayImageUrls = [imageUrl, ...(character.displayImageUrls || [])];
         await character.save();
 
         // Save to CharacterMedia collection with prompt
@@ -823,7 +856,7 @@ const generateImageForCharacter = async (req, res) => {
             characterId: character._id,
             userId: req.user._id,
             mediaType: 'image',
-            mediaUrl: result.imagePath,
+            mediaUrl: imageUrl,
             visibility: 'personal',
             prompt: result.promptUsed,  // Save the AI-generated prompt
             generationParams: {
@@ -896,7 +929,7 @@ const generateVideoForCharacter = async (req, res) => {
         }
 
         // Check ownership
-        const isOwner = character.createdByUserId.toString() === req.user._id.toString();
+        const isOwner = character.createdByUserId && character.createdByUserId.toString() === req.user._id.toString();
         const isAdmin = req.user.role === 'admin';
 
         if (!isOwner && !isAdmin) {

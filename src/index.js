@@ -76,6 +76,10 @@ app.use('/api/v1/characters', characterMediaRoutes);
 app.use('/api/v1/attributes', attributesRoutes);
 // app.use('/api/v1/users', userRoutes);
 
+// SSE Routes (for real-time job updates)
+const sseRoutes = require('./routes/sse.routes');
+app.use('/api/v1/sse', sseRoutes);
+
 // Root route
 app.get('/', (req, res) => {
   res.json({

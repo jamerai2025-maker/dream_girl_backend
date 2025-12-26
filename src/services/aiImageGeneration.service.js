@@ -46,12 +46,27 @@ const generateCharacterImage = async (characterData, pose, occupation = null) =>
 
             if (pose) {
                 characterPayload.personalityId.poseId = pose.name;  // Send pose name directly
+                logger.info(`   ✅ Pose added to payload: ${pose.name}`);
             }
 
             if (occupation) {
-                // Send occupation NAME instead of ID so Python can match it
-                characterPayload.personalityId.occupationId = occupation.name;
+                // Handle both object (with .name) and string occupation
+                let occupationName;
+                if (typeof occupation === 'object' && occupation !== null) {
+                    occupationName = occupation.name || occupation._id?.toString() || 'None';
+                } else if (typeof occupation === 'string') {
+                    occupationName = occupation;
+                } else {
+                    occupationName = 'None';
+                }
+                
+                characterPayload.personalityId.occupationId = occupationName;
+                logger.info(`   ✅ Occupation added to payload: ${occupationName}`);
+            } else {
+                logger.warn(`   ⚠️ No occupation provided - will default to "None" in Python API`);
             }
+        } else {
+            logger.warn(`   ⚠️ No pose or occupation provided`);
         }
 
         // Build API request payload matching Python's GenerateRequest Pydantic model
@@ -89,35 +104,121 @@ const generateCharacterImage = async (characterData, pose, occupation = null) =>
         logger.info(`${'='.repeat(70)}\n`);
 
         // Call AI generation API
-        const response = await axios.post(apiUrl, requestPayload, {
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            timeout: 120000 // 2 minutes timeout
-        });
-
-        // Python API returns: { success, image_base64, character_name, pose, occupation, quality, resolution, generation_time, seed }
-        if (!response.data || !response.data.success || !response.data.image_base64) {
-            throw new Error('Invalid response from AI generation API');
+        let response;
+        try {
+            response = await axios.post(apiUrl, requestPayload, {
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                timeout: 120000 // 2 minutes timeout
+            });
+        } catch (axiosError) {
+            logger.error('❌ Axios request failed:', {
+                message: axiosError.message,
+                code: axiosError.code,
+                status: axiosError.response?.status,
+                statusText: axiosError.response?.statusText,
+                responseData: axiosError.response?.data
+            });
+            throw new Error(`AI generation API request failed: ${axiosError.message}`);
         }
 
-        const { image_base64: base64Image, generation_time, seed, resolution } = response.data;
+        // Log raw response for debugging
+        logger.info(`📥 API Response Status: ${response.status}`);
+        logger.info(`📥 API Response Data: ${JSON.stringify(response.data, null, 2)}`);
 
-        logger.info(`✅ Image generated in ${generation_time}`);
-        logger.info(`   Resolution: ${resolution}, Seed: ${seed}`);
+        // Python API returns: { success, image_url, cloudinary_public_id, upload_path, character_name, pose, occupation, quality, resolution, file_size_kb, format, generation_time, seed }
+        // OR legacy format: { success, image_base64, ... }
+        // OR error format: { success: false, error: "message" } or { detail: "error message" }
+        // Note: Python API uses 'image_url' (not 'cloudinary_url'), but we support both for compatibility
+        if (!response.data) {
+            logger.error('❌ Empty response from AI generation API');
+            throw new Error('Empty response from AI generation API');
+        }
 
-        // Save image to assets folder
-        const imagePath = await saveBase64Image(base64Image, characterData.displayId, characterData.name, characterData._id);
+        const responseData = response.data;
 
-        return {
-            imagePath,
-            generationTime: generation_time,
-            promptUsed: `Generated with pose: ${pose?.name || 'standing'}`,
-            pose: pose?.name,
-            poseCategory: pose?.category,
-            seed: seed,
-            resolution: resolution
-        };
+        // Check for error responses
+        if (responseData.detail) {
+            logger.error(`❌ API returned error: ${responseData.detail}`);
+            throw new Error(`AI generation API error: ${responseData.detail}`);
+        }
+
+        if (responseData.success === false) {
+            const errorMsg = responseData.error || responseData.message || 'Unknown error from AI generation API';
+            logger.error(`❌ API returned success=false: ${errorMsg}`);
+            throw new Error(`AI generation failed: ${errorMsg}`);
+        }
+
+        // Normalize field names: Python API returns 'image_url', but we also support 'cloudinary_url'
+        const cloudinaryUrl = responseData.cloudinary_url || responseData.image_url;
+        const cloudinaryPublicId = responseData.cloudinary_public_id || responseData.cloudinaryPublicId;
+        const uploadPath = responseData.upload_path || responseData.uploadPath;
+
+        // Check if response has required fields (either cloudinary_url/image_url or image_base64)
+        // Allow responses with cloudinary_url/image_url or image_base64 even if success is not explicitly true
+        if (!cloudinaryUrl && !responseData.image_base64) {
+            logger.error(`❌ Invalid response format. Missing required fields. Response data:`, JSON.stringify(responseData, null, 2));
+            throw new Error(`Invalid response from AI generation API: Missing required fields (cloudinary_url/image_url or image_base64)`);
+        }
+
+        // If success is explicitly false, treat as error (unless we have valid data)
+        if (responseData.success === false && !cloudinaryUrl && !responseData.image_base64) {
+            const errorMsg = responseData.error || responseData.message || responseData.detail || 'Unknown error';
+            logger.error(`❌ API returned success=false: ${errorMsg}`);
+            throw new Error(`AI generation failed: ${errorMsg}`);
+        }
+
+        // Check if new format with Cloudinary URLs
+        if (cloudinaryUrl) {
+            logger.info(`✅ Image generated and uploaded to Cloudinary`);
+            logger.info(`   Cloudinary URL: ${cloudinaryUrl}`);
+            logger.info(`   Resolution: ${responseData.resolution}, Seed: ${responseData.seed}`);
+            logger.info(`   File Size: ${responseData.file_size_kb || responseData.fileSizeKb}KB, Format: ${responseData.format}`);
+            logger.info(`   Generation Time: ${responseData.generation_time || responseData.generationTime}`);
+
+            // Use Cloudinary URL as the image path
+            const imagePath = cloudinaryUrl;
+            const finalUploadPath = uploadPath || imagePath;
+
+            return {
+                imagePath,
+                uploadPath: finalUploadPath,
+                cloudinaryUrl: cloudinaryUrl,
+                cloudinaryPublicId: cloudinaryPublicId,
+                generationTime: responseData.generation_time || responseData.generationTime,
+                promptUsed: `Generated with pose: ${responseData.pose || pose?.name || 'standing'}`,
+                pose: responseData.pose || pose?.name,
+                poseCategory: pose?.category,
+                occupation: responseData.occupation,
+                seed: responseData.seed,
+                resolution: responseData.resolution,
+                fileSizeKb: responseData.file_size_kb || responseData.fileSizeKb,
+                format: responseData.format,
+                quality: responseData.quality
+            };
+        }
+
+        // Legacy format: base64 image (backward compatibility)
+        if (responseData.image_base64) {
+            logger.info(`✅ Image generated in ${responseData.generation_time}`);
+            logger.info(`   Resolution: ${responseData.resolution}, Seed: ${responseData.seed}`);
+
+            // Save image to assets folder
+            const imagePath = await saveBase64Image(responseData.image_base64, characterData.displayId, characterData.name, characterData._id);
+
+            return {
+                imagePath,
+                generationTime: responseData.generation_time,
+                promptUsed: `Generated with pose: ${pose?.name || 'standing'}`,
+                pose: pose?.name,
+                poseCategory: pose?.category,
+                seed: responseData.seed,
+                resolution: responseData.resolution
+            };
+        }
+
+        throw new Error('Invalid response format: missing cloudinary_url or image_base64');
 
     } catch (error) {
         logger.error('❌ AI image generation failed:', error.message);

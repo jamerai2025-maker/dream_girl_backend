@@ -14,6 +14,7 @@ const queueConfig = require('../config/queue.config');
 
 imageGenerationQueue.process(queueConfig.workerConcurrency, async (job) => {
     const { userId, characterId, poseId, jobId } = job.data;
+    const sseService = require('../services/sse.service');
 
     logger.info(`🎨 Processing image generation job ${job.id}`, {
         jobId: job.id,
@@ -23,17 +24,26 @@ imageGenerationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
     try {
         // Update job status
-        await MediaGenerationJob.findOneAndUpdate(
+        const updatedJob = await MediaGenerationJob.findOneAndUpdate(
             { jobId: job.id.toString() },
             {
                 status: 'active',
                 startedAt: new Date(),
                 attemptsMade: job.attemptsMade + 1
-            }
+            },
+            { new: true }
         );
+
+        // Broadcast SSE update
+        sseService.broadcastJobUpdate(job.id.toString(), {
+            status: 'active',
+            progress: 0,
+            startedAt: updatedJob.startedAt
+        });
 
         // Get character
         await job.progress(20);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 20, status: 'active' });
         const character = await Character.findById(characterId);
 
         if (!character) {
@@ -42,6 +52,7 @@ imageGenerationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
         // Populate character data
         await job.progress(40);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 40, status: 'active' });
         const populatedCharacter = await populateCharacter(character);
 
         // Get pose object if poseId is provided
@@ -61,7 +72,16 @@ imageGenerationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
         // Generate image
         await job.progress(60);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 60, status: 'active' });
         logger.info(`🎨 Generating AI image for character: ${character.name}`);
+
+        // Get occupation object (populated with name property)
+        const occupation = populatedCharacter.personalityId?.occupationId || null;
+        if (occupation) {
+            logger.info(`✅ Occupation found: ${occupation.name || 'Unknown'}`);
+        } else {
+            logger.warn(`⚠️ No occupation found for character: ${character.name}`);
+        }
 
         const result = await generateCharacterImage(
             {
@@ -83,28 +103,40 @@ imageGenerationQueue.process(queueConfig.workerConcurrency, async (job) => {
                 height: populatedCharacter.physicalAttributesId?.height
             },
             finalPose,  // Pass the pose object (with name property)
-            populatedCharacter.personalityId?.occupationId  // Add occupation as 3rd parameter
+            occupation  // Pass occupation object (with name property) or null
         );
 
-        if (!result?.imagePath) {
-            throw new Error('Image generation failed - no image path returned');
+        // Check if we have either imagePath or cloudinaryUrl
+        if (!result?.imagePath && !result?.cloudinaryUrl) {
+            throw new Error('Image generation failed - no image URL returned');
         }
 
-        logger.info(`✅ Image generated: ${result.imagePath}`);
+        const imageUrlForLog = result.cloudinaryUrl || result.imagePath;
+        logger.info(`✅ Image generated: ${imageUrlForLog}`);
 
         // Create CharacterMedia entry
         await job.progress(80);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 80, status: 'active' });
+        // Use cloudinaryUrl if available, otherwise fall back to imagePath
+        const imageUrl = result.cloudinaryUrl || result.imagePath;
+        
         const media = await CharacterMedia.create({
             characterId: character._id,
             userId: userId,
             mediaType: 'image',
-            mediaUrl: result.imagePath,
+            mediaUrl: imageUrl,
             visibility: 'personal',
             prompt: result.promptUsed,
             generationParams: {
                 model: 'flux-dev',
                 pose: result.pose,
                 poseCategory: result.poseCategory,
+                cloudinaryPublicId: result.cloudinaryPublicId,
+                cloudinaryUrl: result.cloudinaryUrl,
+                uploadPath: result.uploadPath,
+                fileSizeKb: result.fileSizeKb,
+                format: result.format,
+                quality: result.quality,
                 generatedAt: new Date()
             }
         });
@@ -113,29 +145,57 @@ imageGenerationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
         // Update character display images
         await job.progress(90);
-        character.displayImageUrls = character.displayImageUrls || [];
-        if (!character.displayImageUrls.includes(result.imagePath)) {
-            character.displayImageUrls.push(result.imagePath);
-            await character.save();
-            logger.info(`✅ Character displayImageUrls updated: ${character.displayImageUrls.length} images`);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 90, status: 'active' });
+        // Reuse imageUrl from above (already declared at line 106)
+        
+        if (imageUrl) {
+            character.displayImageUrls = character.displayImageUrls || [];
+            if (!character.displayImageUrls.includes(imageUrl)) {
+                character.displayImageUrls.push(imageUrl);
+                await character.save();
+                logger.info(`✅ Character displayImageUrls updated: ${character.displayImageUrls.length} images`);
+                logger.info(`   Image URL: ${imageUrl}`);
+            } else {
+                logger.info(`ℹ️  Image URL already in displayImageUrls: ${imageUrl}`);
+            }
+        } else {
+            logger.warn(`⚠️ No image URL returned from generation result`);
         }
 
         // Update job status
         await job.progress(100);
-        await MediaGenerationJob.findOneAndUpdate(
+        // Reuse imageUrl from above (already declared at line 106)
+        
+        const completedJob = await MediaGenerationJob.findOneAndUpdate(
             { jobId: job.id.toString() },
             {
                 status: 'completed',
                 'result.mediaId': media._id,
-                'result.url': result.imagePath,
+                'result.url': imageUrl,
+                'result.cloudinaryUrl': result.cloudinaryUrl,
+                'result.cloudinaryPublicId': result.cloudinaryPublicId,
                 progress: 100,
                 completedAt: new Date()
-            }
+            },
+            { new: true }
         );
+
+        // Broadcast completion via SSE
+        sseService.broadcastJobUpdate(job.id.toString(), {
+            status: 'completed',
+            progress: 100,
+            result: {
+                mediaId: media._id,
+                url: imageUrl,
+                cloudinaryUrl: result.cloudinaryUrl
+            },
+            completedAt: completedJob.completedAt
+        });
 
         logger.info(`✅ Image generation job completed: ${job.id}`, {
             mediaId: media._id,
-            imageUrl: result.imagePath
+            imageUrl: imageUrl,
+            cloudinaryUrl: result.cloudinaryUrl
         });
 
         return {
@@ -151,15 +211,25 @@ imageGenerationQueue.process(queueConfig.workerConcurrency, async (job) => {
             error: error.message
         });
 
-        await MediaGenerationJob.findOneAndUpdate(
+        const failedJob = await MediaGenerationJob.findOneAndUpdate(
             { jobId: job.id.toString() },
             {
                 status: 'failed',
                 'result.error': error.message,
                 failedReason: error.message,
                 attemptsMade: job.attemptsMade + 1
-            }
+            },
+            { new: true }
         );
+
+        // Broadcast failure via SSE
+        sseService.broadcastJobUpdate(job.id.toString(), {
+            status: 'failed',
+            failedReason: error.message,
+            result: {
+                error: error.message
+            }
+        });
 
         throw error;
     }

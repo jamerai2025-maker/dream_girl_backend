@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+docker-compose.yml
 
 # Environment files
 .env

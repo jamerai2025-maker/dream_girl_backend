@@ -17,6 +17,7 @@ const queueConfig = require('../config/queue.config');
 // Process character creation jobs
 characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
     const { userId, characterData, jobId } = job.data;
+    const sseService = require('../services/sse.service');
 
     logger.info(`🔨 Processing character creation job ${job.id}`, {
         jobId: job.id,
@@ -26,17 +27,26 @@ characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
     try {
         // Update job status to active
-        await CharacterJob.findOneAndUpdate(
+        const updatedJob = await CharacterJob.findOneAndUpdate(
             { jobId: job.id.toString() },
             {
                 status: 'active',
                 startedAt: new Date(),
                 attemptsMade: job.attemptsMade + 1
-            }
+            },
+            { new: true }
         );
+
+        // Broadcast SSE update
+        sseService.broadcastJobUpdate(job.id.toString(), {
+            status: 'active',
+            progress: 0,
+            startedAt: updatedJob.startedAt
+        });
 
         // Step 1: Create main character document (10% progress)
         await job.progress(10);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 10, status: 'active' });
         const character = await Character.create({
             name: characterData.name,
             age: characterData.age,
@@ -53,6 +63,7 @@ characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
         // Step 2: Create linked documents (30% progress)
         await job.progress(30);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 30, status: 'active' });
         const linkedDocs = await createLinkedDocuments(character._id, characterData);
         Object.assign(character, linkedDocs);
         await character.save();
@@ -61,10 +72,12 @@ characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
         // Step 3: Populate character (40% progress)
         await job.progress(40);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 40, status: 'active' });
         let populatedCharacter = await populateCharacter(character);
 
         // Step 4: Generate AI personality (60% progress)
         await job.progress(60);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 60, status: 'active' });
         if (populatedCharacter.personalityId) {
             try {
                 logger.info(`🤖 Generating AI personality for: ${character.name}`);
@@ -95,6 +108,7 @@ characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
         // Step 5: Generate AI image (80% progress)
         await job.progress(80);
+        sseService.broadcastJobUpdate(job.id.toString(), { progress: 80, status: 'active' });
         const aiGenerationEnabled = process.env.AI_GENERATION_ENABLED === 'true';
 
         if (aiGenerationEnabled && populatedCharacter.personalityId?.poseId) {
@@ -157,15 +171,23 @@ characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
 
                         // Update character with display image
                         logger.info(`📝 Step 2: Updating Character.displayImageUrls array...`);
-                        character.displayImageUrls = character.displayImageUrls || [];
-                        if (!character.displayImageUrls.includes(result.imagePath)) {
-                            character.displayImageUrls.push(result.imagePath);
+                        // Use cloudinaryUrl if available, otherwise fall back to imagePath
+                        const imageUrl = result.cloudinaryUrl || result.imagePath;
+                        
+                        if (imageUrl) {
+                            character.displayImageUrls = character.displayImageUrls || [];
+                            if (!character.displayImageUrls.includes(imageUrl)) {
+                                character.displayImageUrls.push(imageUrl);
+                            }
+
+                            logger.info(`📝 Step 3: Saving character document...`);
+                            await character.save();
+
+                            logger.info(`✅ AI image saved to database successfully: ${imageUrl}`);
+                            logger.info(`   Cloudinary URL: ${result.cloudinaryUrl || 'N/A'}`);
+                        } else {
+                            logger.warn(`⚠️ No image URL returned from generation result`);
                         }
-
-                        logger.info(`📝 Step 3: Saving character document...`);
-                        await character.save();
-
-                        logger.info(`✅ AI image saved to database successfully: ${result.imagePath}`);
                     } catch (dbError) {
                         logger.error(`❌ DATABASE SAVE ERROR:`, {
                             errorMessage: dbError.message,
@@ -189,15 +211,28 @@ characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
         await job.progress(100);
 
         // Update job status to completed
-        await CharacterJob.findOneAndUpdate(
+        const completedJob = await CharacterJob.findOneAndUpdate(
             { jobId: job.id.toString() },
             {
                 status: 'completed',
                 'result.characterId': character._id,
                 progress: 100,
                 completedAt: new Date()
-            }
+            },
+            { new: true }
         );
+
+        // Broadcast completion via SSE
+        sseService.broadcastJobUpdate(job.id.toString(), {
+            status: 'completed',
+            progress: 100,
+            result: {
+                characterId: character._id,
+                displayId: character.displayId,
+                name: character.name
+            },
+            completedAt: completedJob.completedAt
+        });
 
         logger.info(`✅ Character creation job completed: ${job.id}`, {
             jobId: job.id,
@@ -221,15 +256,25 @@ characterCreationQueue.process(queueConfig.workerConcurrency, async (job) => {
         });
 
         // Update job status to failed
-        await CharacterJob.findOneAndUpdate(
+        const failedJob = await CharacterJob.findOneAndUpdate(
             { jobId: job.id.toString() },
             {
                 status: 'failed',
                 'result.error': error.message,
                 failedReason: error.message,
                 attemptsMade: job.attemptsMade + 1
-            }
+            },
+            { new: true }
         );
+
+        // Broadcast failure via SSE
+        sseService.broadcastJobUpdate(job.id.toString(), {
+            status: 'failed',
+            failedReason: error.message,
+            result: {
+                error: error.message
+            }
+        });
 
         throw error;
     }

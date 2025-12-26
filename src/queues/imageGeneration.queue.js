@@ -57,10 +57,19 @@ imageGenerationQueue.process(5, async (job) => {
         // Update character with generated image
         const character = await Character.findById(characterData._id);
         if (character) {
-            character.displayImageUrls = [result.imagePath, ...(character.displayImageUrls || [])];
-            await character.save();
+            // Use cloudinaryUrl if available, otherwise fall back to imagePath
+            const imageUrl = result.cloudinaryUrl || result.imagePath;
+            
+            if (imageUrl) {
+                character.displayImageUrls = [imageUrl, ...(character.displayImageUrls || [])];
+                await character.save();
 
-            logger.info(`✅ Image added to character: ${character._id}`);
+                logger.info(`✅ Image added to character: ${character._id}`);
+                logger.info(`   Image URL: ${imageUrl}`);
+                logger.info(`   Cloudinary URL: ${result.cloudinaryUrl || 'N/A'}`);
+            } else {
+                logger.warn(`⚠️ No image URL returned from generation result`);
+            }
         }
 
         await job.progress(100);
